@@ -1,14 +1,12 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -55,9 +53,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	defer file.Close()
 
-	contentType := header.Header.Get("Content-Type")
-
-	mediaType, _, err := mime.ParseMediaType(contentType)
+	mediaType, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
 	if err != nil || mediaType != "video/mp4" {
 		respondWithError(w, http.StatusBadRequest, "error parsing mp4 mime type", err)
 		return
@@ -83,23 +79,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	randomBytes := make([]byte, 32)
-	_, err = rand.Read(randomBytes)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error generating random bytes", err)
-		return
-	}
-	fileKey := hex.EncodeToString(randomBytes) + ".mp4"
-
-	if contentType == "" {
-		contentType = "video/mp4"
-	}
+	fileKey := getAssetPath(mediaType)
 
 	putObjectInput := &s3.PutObjectInput{
-		Bucket:      &cfg.s3Bucket,
-		Key:         &fileKey,
+		Bucket:      aws.String(cfg.s3Bucket),
+		Key:         aws.String(fileKey),
 		Body:        uploadFile,
-		ContentType: &contentType, // Use the content type from the header
+		ContentType: aws.String(mediaType),
 	}
 
 	_, err = cfg.s3client.PutObject(r.Context(), putObjectInput)
@@ -117,7 +103,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s3VideoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileKey)
+	s3VideoURL := cfg.getObjectURL(fileKey)
 	video.VideoURL = &s3VideoURL
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
