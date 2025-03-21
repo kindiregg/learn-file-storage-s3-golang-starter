@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
@@ -79,13 +86,28 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(uploadFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error getting file aspect ratio", err)
+	}
+	var ratioPrefix string
+	if aspectRatio == "16:9" {
+		ratioPrefix = "landscape"
+	} else if aspectRatio == "9:16" {
+		ratioPrefix = "portrait"
+	} else {
+		ratioPrefix = "other"
+	}
+
 	fileKey := getAssetPath(mediaType)
+	fileKey = filepath.Join(ratioPrefix, fileKey)
 
 	putObjectInput := &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileKey),
 		Body:        uploadFile,
 		ContentType: aws.String(mediaType),
+		ACL:         types.ObjectCannedACLPublicRead,
 	}
 
 	_, err = cfg.s3client.PutObject(r.Context(), putObjectInput)
@@ -108,6 +130,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error updating video", err)
+		return
 	}
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
@@ -116,4 +139,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, map[string]string{"video_url": *video.VideoURL})
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	log.Printf("Analyzing file: %s", filePath)
+	var stdoutBuffer, stderrBuffer bytes.Buffer
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	cmd.Stdout = &stdoutBuffer
+	cmd.Stderr = &stderrBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("ffprobe error: %v\nstderr: %s\n", err, stderrBuffer.String())
+		return "", err
+	}
+
+	var fileData struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	if err := json.Unmarshal(stdoutBuffer.Bytes(), &fileData); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe output: %v", err)
+	}
+
+	if len(fileData.Streams) == 0 {
+		return "", fmt.Errorf("no streams found in video file")
+	}
+
+	ratio := float64(fileData.Streams[0].Width) / float64(fileData.Streams[0].Height)
+	log.Printf("Width: %d, Height: %d, Calculated Ratio: %f", fileData.Streams[0].Width, fileData.Streams[0].Height, ratio)
+	if ratio >= 1.77 && ratio <= 1.78 { // Roughly 16:9 allowing for inexact ratio
+		return "16:9", nil
+	} else if ratio >= 0.56 && ratio <= 0.57 { // Roughly 9:16 allowing for inexact ratio
+		return "9:16", nil
+	} else {
+		return "other", nil
+	}
 }
