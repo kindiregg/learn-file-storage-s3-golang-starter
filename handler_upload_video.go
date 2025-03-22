@@ -66,27 +66,45 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	uploadFile, err := os.CreateTemp("", "tubely-upload.mp4")
+	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error creating temporary file", err)
 		return
 	}
-	defer os.Remove(uploadFile.Name())
-	defer uploadFile.Close()
 
-	_, err = io.Copy(uploadFile, file)
+	defer tempFile.Close()
+	defer os.Remove(tempFile.Name())
+
+	_, err = io.Copy(tempFile, file)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error copying data to upload file", err)
 		return
 	}
 
-	_, err = uploadFile.Seek(0, io.SeekStart)
+	tempFile.Sync()
+
+	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error resetting upload file pointer", err)
 		return
 	}
 
-	aspectRatio, err := getVideoAspectRatio(uploadFile.Name())
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error processing video", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error opening processed video file", err)
+		return
+	}
+
+	defer processedFile.Close()
+
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error getting file aspect ratio", err)
 	}
@@ -105,7 +123,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	putObjectInput := &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileKey),
-		Body:        uploadFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 		ACL:         types.ObjectCannedACLPublicRead,
 	}
@@ -127,11 +145,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	s3VideoURL := cfg.getObjectURL(fileKey)
 	video.VideoURL = &s3VideoURL
-
-	if err := cfg.db.UpdateVideo(video); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "error updating video", err)
-		return
-	}
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error updating video", err)
@@ -178,4 +191,21 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	} else {
 		return "other", nil
 	}
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	var stderrBuffer bytes.Buffer
+	outputPath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i",
+		filePath, "-c",
+		"copy", "-movflags",
+		"faststart", "-f", "mp4", outputPath)
+	cmd.Stderr = &stderrBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("ffmpeg error: %v\nstderr: %s\n", err, stderrBuffer.String())
+		return "", err
+	}
+	return outputPath, nil
 }
